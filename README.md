@@ -58,6 +58,8 @@ This makes Prophet's output interpretable — you can see *why* it predicts what
 
 No installation, no dependencies — it just runs.
 
+> **Note:** Since this app isn't signed with a paid Windows code-signing certificate, Windows SmartScreen may show a warning ("Windows protected your PC"). This is expected for independently-built apps — click **"More info" → "Run anyway"** to proceed. The app is open-source; you can review the full code in this repo.
+
 ### Option 2 — Run from source (any OS)
 
 ```bash
