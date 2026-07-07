@@ -1,11 +1,13 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
 import numpy as np
 import pandas as pd
-import streamlit as st
 from prophet import Prophet
-from prophet.plot import plot_components_plotly
-import plotly.graph_objects as go
-
-st.set_page_config(page_title="Sales & Demand Forecasting Dashboard", layout="wide")
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 
 def generate_sample_sales_data(start_date="2022-01-01", periods=730, seed=42):
@@ -17,7 +19,7 @@ def generate_sample_sales_data(start_date="2022-01-01", periods=730, seed=42):
     yearly_seasonality = 40 * np.sin(2 * np.pi * (t - 80) / 365)
     day_of_week = dates.dayofweek
     weekly_seasonality = np.where(day_of_week >= 5, 25, 0)
-    noise = rng.normal(loc=0, scale=15, size=periods)
+    noise = rng.normal(0, 15, size=periods)
 
     y = trend + yearly_seasonality + weekly_seasonality + noise
     y = np.maximum(y, 0)
@@ -25,172 +27,207 @@ def generate_sample_sales_data(start_date="2022-01-01", periods=730, seed=42):
     return pd.DataFrame({"ds": dates, "y": y})
 
 
-@st.cache_resource(show_spinner=False)
-def fit_model(df, weekly_seasonality, yearly_seasonality, interval_width):
-    m = Prophet(
-        weekly_seasonality=weekly_seasonality,
-        yearly_seasonality=yearly_seasonality,
-        daily_seasonality=False,
-        interval_width=interval_width,
-    )
-    m.fit(df)
-    return m
+class ForecastApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Sales & Demand Forecasting Dashboard")
+        self.geometry("1150x750")
+        self.minsize(950, 650)
 
+        self.df = None
+        self.forecast = None
+        self.model = None
 
-def compute_backtest_metrics(df, horizon_days, weekly_seasonality, yearly_seasonality):
-    if len(df) <= horizon_days + 30:
-        return None
+        self.build_top_bar()
+        self.build_tabs()
 
-    train = df.iloc[:-horizon_days]
-    test = df.iloc[-horizon_days:]
+    def build_top_bar(self):
+        bar = ttk.Frame(self, padding=10)
+        bar.pack(side="top", fill="x")
 
-    m = Prophet(
-        weekly_seasonality=weekly_seasonality,
-        yearly_seasonality=yearly_seasonality,
-        daily_seasonality=False,
-    )
-    m.fit(train)
+        ttk.Button(bar, text="Use Sample Data", command=self.load_sample_data).pack(side="left", padx=5)
+        ttk.Button(bar, text="Upload CSV", command=self.upload_csv).pack(side="left", padx=5)
 
-    future = m.make_future_dataframe(periods=horizon_days)
-    forecast = m.predict(future)
-    pred = forecast.set_index("ds").loc[test["ds"], "yhat"].values
-    actual = test["y"].values
+        ttk.Label(bar, text="Forecast days:").pack(side="left", padx=(20, 5))
+        self.horizon_var = tk.IntVar(value=90)
+        ttk.Spinbox(bar, from_=7, to=365, textvariable=self.horizon_var, width=6).pack(side="left")
 
-    mae = np.mean(np.abs(pred - actual))
-    rmse = np.sqrt(np.mean((pred - actual) ** 2))
-    return {"mae": mae, "rmse": rmse, "n_days": horizon_days}
+        ttk.Button(bar, text="Run Forecast", command=self.run_forecast_threaded).pack(side="left", padx=20)
+        ttk.Button(bar, text="Export Forecast CSV", command=self.export_csv).pack(side="left", padx=5)
 
+        self.status_var = tk.StringVar(value="No data loaded yet.")
+        ttk.Label(bar, textvariable=self.status_var, foreground="gray").pack(side="right", padx=10)
 
-st.sidebar.header("1. Data Source")
-data_source = st.sidebar.radio("Choose data source", ["Use sample data", "Upload my own CSV"])
+    def build_tabs(self):
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True)
 
-df = None
+        self.tab_data = ttk.Frame(self.tabs)
+        self.tab_forecast = ttk.Frame(self.tabs)
+        self.tab_components = ttk.Frame(self.tabs)
+        self.tab_table = ttk.Frame(self.tabs)
 
-if data_source == "Use sample data":
-    df = generate_sample_sales_data()
-    st.sidebar.success("Using generated sample sales data (2 years, daily)")
-else:
-    uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-    if uploaded_file is not None:
-        raw_df = pd.read_csv(uploaded_file)
-        st.sidebar.write("Preview:")
-        st.sidebar.dataframe(raw_df.head(), height=150)
+        self.tabs.add(self.tab_data, text="Input Data")
+        self.tabs.add(self.tab_forecast, text="Actual vs Predicted")
+        self.tabs.add(self.tab_components, text="Trend & Seasonality")
+        self.tabs.add(self.tab_table, text="Forecast Table")
 
-        date_col = st.sidebar.selectbox("Which column is the date?", raw_df.columns)
-        value_col = st.sidebar.selectbox(
-            "Which column is the value to forecast?",
-            [c for c in raw_df.columns if c != date_col],
+        self.data_tree = self.make_tree(self.tab_data)
+        self.table_tree = self.make_tree(self.tab_table)
+
+        self.fig1 = Figure(figsize=(9, 5), dpi=100)
+        self.ax1 = self.fig1.add_subplot(111)
+        self.canvas1 = FigureCanvasTkAgg(self.fig1, master=self.tab_forecast)
+        self.canvas1.get_tk_widget().pack(fill="both", expand=True)
+
+        self.canvas2 = None
+
+    def make_tree(self, parent):
+        tree = ttk.Treeview(parent, show="headings")
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        return tree
+
+    def fill_tree(self, tree, df):
+        tree.delete(*tree.get_children())
+        tree["columns"] = list(df.columns)
+        for col in df.columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=140, anchor="center")
+        for _, row in df.iterrows():
+            tree.insert("", "end", values=list(row))
+
+    def load_sample_data(self):
+        self.df = generate_sample_sales_data()
+        self.status_var.set(f"Sample data loaded: {len(self.df)} rows")
+        self.fill_tree(self.data_tree, self.df.tail(50))
+
+    def upload_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+
+        raw_df = pd.read_csv(path)
+        col_window = tk.Toplevel(self)
+        col_window.title("Select columns")
+        col_window.geometry("320x160")
+
+        ttk.Label(col_window, text="Date column:").pack(pady=(15, 0))
+        date_var = tk.StringVar(value=raw_df.columns[0])
+        ttk.Combobox(col_window, textvariable=date_var, values=list(raw_df.columns), state="readonly").pack()
+
+        ttk.Label(col_window, text="Value column:").pack(pady=(10, 0))
+        value_var = tk.StringVar(value=raw_df.columns[-1])
+        ttk.Combobox(col_window, textvariable=value_var, values=list(raw_df.columns), state="readonly").pack()
+
+        def confirm():
+            date_col = date_var.get()
+            value_col = value_var.get()
+            df = raw_df[[date_col, value_col]].rename(columns={date_col: "ds", value_col: "y"})
+            df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+            df["y"] = pd.to_numeric(df["y"], errors="coerce")
+            df = df.dropna().sort_values("ds").reset_index(drop=True)
+
+            if df.empty:
+                messagebox.showerror("Error", "Couldn't parse that date/value column combination.")
+                return
+
+            self.df = df
+            self.status_var.set(f"Uploaded data loaded: {len(self.df)} rows")
+            self.fill_tree(self.data_tree, self.df.tail(50))
+            col_window.destroy()
+
+        ttk.Button(col_window, text="Confirm", command=confirm).pack(pady=15)
+
+    def run_forecast_threaded(self):
+        if self.df is None:
+            messagebox.showwarning("No data", "Load sample data or upload a CSV first.")
+            return
+        self.status_var.set("Fitting Prophet model...")
+        thread = threading.Thread(target=self.run_forecast)
+        thread.start()
+
+    def run_forecast(self):
+        try:
+            horizon = self.horizon_var.get()
+            model = Prophet(weekly_seasonality=True, yearly_seasonality=True, daily_seasonality=False)
+            model.fit(self.df)
+
+            future = model.make_future_dataframe(periods=horizon)
+            forecast = model.predict(future)
+
+            self.model = model
+            self.forecast = forecast
+
+            self.after(0, self.update_plots)
+            self.after(0, lambda: self.status_var.set(f"Forecast complete: {horizon} days ahead"))
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.after(0, lambda: self.status_var.set("Error during forecasting"))
+
+    def update_plots(self):
+        self.ax1.clear()
+        self.ax1.plot(self.df["ds"], self.df["y"], "k.", alpha=0.5, markersize=3, label="Actual")
+        self.ax1.plot(self.forecast["ds"], self.forecast["yhat"], color="royalblue", label="Predicted")
+        self.ax1.fill_between(
+            self.forecast["ds"], self.forecast["yhat_lower"], self.forecast["yhat_upper"],
+            color="royalblue", alpha=0.2, label="Confidence Interval"
         )
+        self.ax1.legend()
+        self.ax1.set_title("Actual vs Predicted")
+        self.ax1.set_xlabel("Date")
+        self.ax1.set_ylabel("Value")
+        self.fig1.tight_layout()
+        self.canvas1.draw()
 
-        df = raw_df[[date_col, value_col]].rename(columns={date_col: "ds", value_col: "y"})
-        df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
-        df["y"] = pd.to_numeric(df["y"], errors="coerce")
-        df = df.dropna().sort_values("ds").reset_index(drop=True)
+        try:
+            for widget in self.tab_components.winfo_children():
+                widget.destroy()
+            comp_fig = self.model.plot_components(self.forecast)
+            comp_fig.set_size_inches(9, 7)
+            self.canvas2 = FigureCanvasTkAgg(comp_fig, master=self.tab_components)
+            self.canvas2.get_tk_widget().pack(fill="both", expand=True)
+            self.canvas2.draw()
+        except Exception as e:
+            messagebox.showerror("Components plot error", str(e))
 
-        if df.empty:
-            st.sidebar.error("Couldn't parse that date/value column combination. Check the CSV.")
-            st.stop()
-    else:
-        st.info("Upload a CSV from the sidebar, or switch to sample data, to see the dashboard.")
-        st.stop()
+        try:
+            table_df = (
+                self.forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+                .tail(self.horizon_var.get())
+                .rename(columns={
+                    "ds": "Date", "yhat": "Predicted",
+                    "yhat_lower": "Lower Bound", "yhat_upper": "Upper Bound"
+                })
+            )
+            table_df["Date"] = table_df["Date"].dt.strftime("%Y-%m-%d")
+            for col in ["Predicted", "Lower Bound", "Upper Bound"]:
+                table_df[col] = table_df[col].round(2)
+            self.fill_tree(self.table_tree, table_df)
+        except Exception as e:
+            messagebox.showerror("Forecast table error", str(e))
 
-st.sidebar.header("2. Forecast Settings")
-horizon = st.sidebar.slider("Days to forecast into the future", 7, 365, 90)
-interval_width = st.sidebar.slider("Confidence interval width", 0.50, 0.95, 0.80, step=0.05)
-weekly_seasonality = st.sidebar.checkbox("Weekly seasonality", value=True)
-yearly_seasonality = st.sidebar.checkbox("Yearly seasonality", value=True)
-run_backtest = st.sidebar.checkbox("Run accuracy backtest (MAE/RMSE)", value=True)
+    def export_csv(self):
+        if self.forecast is None:
+            messagebox.showwarning("No forecast", "Run a forecast first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        table_df = (
+            self.forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+            .tail(self.horizon_var.get())
+            .rename(columns={
+                "ds": "Date", "yhat": "Predicted",
+                "yhat_lower": "Lower Bound", "yhat_upper": "Upper Bound"
+            })
+        )
+        table_df.to_csv(path, index=False)
+        messagebox.showinfo("Saved", f"Forecast saved to {path}")
 
-st.title("📈 Sales / Demand Forecasting Dashboard")
-st.caption("Forecasting powered by Facebook/Meta Prophet")
 
-st.subheader("Input Data")
-col_a, col_b = st.columns([2, 1])
-with col_a:
-    st.dataframe(df.tail(10), use_container_width=True)
-with col_b:
-    st.metric("Total rows", len(df))
-    st.metric("Date range", f"{df['ds'].min().date()} → {df['ds'].max().date()}")
-    st.metric("Average value", f"{df['y'].mean():.1f}")
-
-with st.spinner("Fitting Prophet model..."):
-    model = fit_model(df, weekly_seasonality, yearly_seasonality, interval_width)
-
-future = model.make_future_dataframe(periods=horizon)
-forecast = model.predict(future)
-
-st.subheader("Actual vs Predicted (with confidence interval)")
-fig1 = go.Figure()
-
-fig1.add_trace(go.Scatter(
-    x=forecast["ds"], y=forecast["yhat_upper"],
-    mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"
-))
-fig1.add_trace(go.Scatter(
-    x=forecast["ds"], y=forecast["yhat_lower"],
-    mode="lines", line=dict(width=0), fill="tonexty",
-    fillcolor="rgba(99,110,250,0.2)", name=f"{int(interval_width*100)}% Confidence Interval",
-    hoverinfo="skip"
-))
-fig1.add_trace(go.Scatter(
-    x=forecast["ds"], y=forecast["yhat"],
-    mode="lines", name="Predicted", line=dict(color="royalblue")
-))
-fig1.add_trace(go.Scatter(
-    x=df["ds"], y=df["y"],
-    mode="markers", name="Actual", marker=dict(color="black", size=4, opacity=0.6)
-))
-
-fig1.update_layout(
-    height=480, xaxis_title="Date", yaxis_title="Value",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-    margin=dict(t=40),
-)
-st.plotly_chart(fig1, use_container_width=True)
-
-if run_backtest:
-    metrics = compute_backtest_metrics(df, min(horizon, max(7, len(df) // 5)), weekly_seasonality, yearly_seasonality)
-    if metrics:
-        st.subheader("Backtest Accuracy")
-        st.caption(f"Model trained on all data except the last {metrics['n_days']} days, then evaluated on those held-out days.")
-        c1, c2 = st.columns(2)
-        c1.metric("MAE (Mean Absolute Error)", f"{metrics['mae']:.2f}")
-        c2.metric("RMSE (Root Mean Squared Error)", f"{metrics['rmse']:.2f}")
-    else:
-        st.caption("Not enough historical data to run a meaningful backtest.")
-
-st.subheader(f"Forecast — Next {horizon} Days")
-forecast_display = (
-    forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
-    .tail(horizon)
-    .rename(columns={
-        "ds": "Date", "yhat": "Predicted",
-        "yhat_lower": "Lower Bound", "yhat_upper": "Upper Bound"
-    })
-)
-st.dataframe(forecast_display, use_container_width=True)
-
-csv_bytes = forecast_display.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download forecast as CSV", csv_bytes, "forecast.csv", "text/csv")
-
-st.subheader("Trend & Seasonality Breakdown")
-fig2 = plot_components_plotly(model, forecast)
-st.plotly_chart(fig2, use_container_width=True)
-
-with st.expander("ℹ️ What am I looking at? (Trend / Seasonality explained)"):
-    st.markdown("""
-    - **Trend**: the long-term direction of the data with random noise removed —
-      is the underlying quantity generally growing, shrinking, or flat over time,
-      and where did that direction change (Prophet's "changepoints")?
-    - **Weekly seasonality**: the repeating pattern within a week — e.g. do
-      weekends consistently run higher or lower than weekdays?
-    - **Yearly seasonality**: the repeating pattern across a year — e.g. a
-      holiday-season bump, a summer slump, etc.
-    - **Confidence interval (shaded band)**: the range Prophet considers
-      plausible for the actual future value, not just a single number. It
-      widens the further into the future you forecast, because uncertainty
-      compounds — this is expected and correct behavior, not a bug.
-    """)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Built with Prophet + Streamlit · Sales/Demand Forecasting Dashboard")
+if __name__ == "__main__":
+    app = ForecastApp()
+    app.mainloop()
